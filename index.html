@@ -386,6 +386,20 @@ body.maxView #hud { top: max(12px, env(safe-area-inset-top)); left: max(12px, en
 .xfer .hidden { display: none; }
 .xfer h3 { margin: 0 0 4px; font-size: 14px; }
 .xfer textarea { width: 100%; box-sizing: border-box; margin-top: 8px; font: 12px/1.3 ui-monospace, Menlo, Consolas, monospace; background: rgba(0,0,0,.35); color: inherit; border: 1px solid rgba(255,255,255,.2); border-radius: 6px; padding: 6px; resize: vertical; word-break: break-all; }
+
+/* account: sign-in badge and modal */
+#acctBadge { display: flex; justify-content: flex-end; margin-top: 6px; }
+#acctBadge .acct { font-size: 12.5px; padding: 4px 10px; color: var(--dim); }
+#acctBadge .acct.on { color: var(--text); }
+.acctcard { max-width: 420px; }
+.acctcard .gbtn { width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; background: #fff; border-color: #fff; color: #1f1f1f; }
+.acctcard .gbtn:hover { background: #f1f3f4; color: #1f1f1f; }
+.acctcard .gbtn svg { width: 18px; height: 18px; }
+.acctcard .or { display: flex; align-items: center; gap: 8px; margin: 14px 0 8px; color: var(--faint); font-size: 12px; }
+.acctcard .or::before, .acctcard .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.acctcard .emailrow { display: flex; gap: 8px; }
+.acctcard .emailrow input { flex: 1; min-width: 0; font: inherit; font-size: 16px; background: #04070b; color: #fff; border: 1px solid var(--line); border-radius: var(--r); padding: 8px 10px; }
+.acctcard #acctBack { margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -491,7 +505,7 @@ body.maxView #hud { top: max(12px, env(safe-area-inset-top)); left: max(12px, en
     <h2>Career</h2>
     <div id="careerDetail"></div>
     <div id="awardGrid"></div>
-    <p class="sub">Progress is saved in this browser, so each device and site keeps its own career. Use a progress code below to move it.</p>
+    <p class="sub">Progress is saved in this browser. On clearance.copperskygames.com, sign in to keep it on every device; otherwise use a progress code below to move it.</p>
     <button id="awardsBack">Back</button>
   </div>
 </div>
@@ -4788,7 +4802,7 @@ window.ATC_FAA = {"cycle":"2026-11-26","expires":"2026-12-24","generated":"2026-
   }
   function reset() { C = blank(); save(); }
 
-  ATC.career = { RANKS, AWARDS, SEATS, get: () => C, rankInfo, startSession, sessionState, resumeSession, tick, lessonDone, onNotify, reset, endSession: () => { sess = null; } };
+  ATC.career = { RANKS, AWARDS, SEATS, get: () => C, rankInfo, startSession, sessionState, resumeSession, tick, lessonDone, onNotify, reset, load: (v) => { C = Object.assign(blank(), v); save(); }, endSession: () => { sess = null; } };
 })();
 </script>
 <script>
@@ -5109,6 +5123,7 @@ window.ATC_MAP = {"land":[[313,-224,294,-222,290,-218,280,-216,277,-211,277,-205
   }
   CAR.onNotify((n) => { toast(n); if (sim) onMsg({ kind: 'good', clock: sim.clockStr(), text: `${n.title}. ${n.text}` }); });
   careerCard();
+  window.addEventListener('atc:career', careerCard);   // career replaced by a cloud sync
   let careerAt = 0;
 
   // ── training ──────────────────────────────────────────────────────────────
@@ -6714,6 +6729,211 @@ window.ATC_MAP = {"land":[[313,-224,294,-222,290,-218,280,-216,277,-211,277,-205
     };
   }
   window.ATC_TRANSFER = { makeCode, readCode };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+</script>
+<script>
+// Accounts: optional sign-in (Google or an email link) through Supabase, and career sync.
+// The game never needs this: signed out, the career stays in this browser as before.
+// Only the public (publishable) key lives here; it is safe in a web page by design.
+// Talks to Supabase's REST endpoints directly, so there is no library to load.
+(function () {
+  'use strict';
+  const SB = 'https://bodebdweujorbvztqrir.supabase.co';
+  const KEY = 'sb_publishable_xVq9V8m9Rhm8gyOgJdla8g_P6uSrfM9';
+  const AUTH = 'clr.auth';        // not "atc." so progress codes never carry sign-in tokens
+  const CAREER = 'atc.career';
+  // Sign-in only works where Supabase may send players back to: the website and local testing.
+  const ENABLED = /(^|\.)copperskygames\.com$/.test(location.hostname) || /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+
+  let auth = null;                 // { access_token, refresh_token, expires_at, user: { id, email, name } }
+  let status = 'idle';             // idle | syncing | synced | offline
+  let lastPushed = null;
+  const listeners = [];
+
+  const ls = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+    del(k) { try { localStorage.removeItem(k); } catch (e) {} },
+  };
+  const emit = () => listeners.forEach((f) => { try { f(); } catch (e) {} });
+  const setStatus = (s) => { status = s; emit(); };
+
+  // ── session tokens ──
+  function userFrom(u) {
+    const m = (u && u.user_metadata) || {};
+    return u ? { id: u.id, email: u.email || '', name: m.full_name || m.name || (u.email || '').split('@')[0] } : null;
+  }
+  function saveAuth(a) { auth = a; if (a) ls.set(AUTH, JSON.stringify(a)); else ls.del(AUTH); emit(); }
+  async function api(path, opts = {}) {
+    const h = Object.assign({ apikey: KEY, 'Content-Type': 'application/json' }, opts.headers || {});
+    if (opts.token) h.Authorization = 'Bearer ' + opts.token;
+    const r = await fetch(SB + path, { method: opts.method || 'GET', headers: h, body: opts.body ? JSON.stringify(opts.body) : undefined, keepalive: !!opts.keepalive });
+    const txt = await r.text(); let data = null; try { data = txt ? JSON.parse(txt) : null; } catch (e) {}
+    if (!r.ok) { const err = new Error((data && (data.msg || data.message || data.error_description || data.error)) || ('HTTP ' + r.status)); err.status = r.status; throw err; }
+    return data;
+  }
+  async function token() {
+    if (!auth) return null;
+    if (Date.now() / 1000 < auth.expires_at - 60) return auth.access_token;
+    try {
+      const d = await api('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: { refresh_token: auth.refresh_token } });
+      saveAuth({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: d.expires_at || Math.floor(Date.now() / 1000) + (d.expires_in || 3600), user: userFrom(d.user) || auth.user });
+      return auth.access_token;
+    } catch (e) {
+      if (e.status === 400 || e.status === 401) saveAuth(null);   // refresh token revoked or expired: signed out
+      throw e;
+    }
+  }
+  // Coming back from Google or an email link: the tokens arrive in the address after "#".
+  async function readReturn() {
+    const h = location.hash.slice(1); if (!/access_token=|error=/.test(h)) return null;
+    const p = new URLSearchParams(h);
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+    if (p.get('error')) return (p.get('error_description') || p.get('error')).replace(/\+/g, ' ');
+    const a = { access_token: p.get('access_token'), refresh_token: p.get('refresh_token'),
+      expires_at: +p.get('expires_at') || Math.floor(Date.now() / 1000) + (+p.get('expires_in') || 3600), user: null };
+    try { a.user = userFrom(await api('/auth/v1/user', { token: a.access_token })); } catch (e) { return 'Sign-in did not finish. Please try again.'; }
+    saveAuth(a);
+    return null;
+  }
+  const returnUrl = () => location.origin + location.pathname;
+  function signInGoogle() {
+    location.href = `${SB}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(returnUrl())}`;
+  }
+  async function signInEmail(email) {
+    await api('/auth/v1/otp?redirect_to=' + encodeURIComponent(returnUrl()), { method: 'POST', body: { email, create_user: true } });
+  }
+  async function signOut() {
+    try { await push(); } catch (e) {}
+    try { const t = auth && auth.access_token; if (t) await api('/auth/v1/logout', { method: 'POST', token: t }); } catch (e) {}
+    lastPushed = null; saveAuth(null); setStatus('idle');
+  }
+
+  // ── career sync ──
+  // Two careers from different devices combine by keeping the best of each number and
+  // every lesson and award, so playing on one device never wipes out another.
+  function merge(a, b) {
+    a = a || {}; b = b || {};
+    const mx = (x, y) => Math.max(+x || 0, +y || 0);
+    const mxMap = (x, y) => { const o = Object.assign({}, x || {}); for (const k in (y || {})) o[k] = mx(o[k], y[k]); return o; };
+    const awards = Object.assign({}, a.awards || {});
+    for (const k in (b.awards || {})) awards[k] = awards[k] ? Math.min(awards[k], b.awards[k]) : b.awards[k];
+    return Object.assign({}, a, b, {
+      xp: mx(a.xp, b.xp), seatXp: mxMap(a.seatXp, b.seatXp),
+      lessons: [...new Set([...(a.lessons || []), ...(b.lessons || [])])], awards,
+      worked: mx(a.worked, b.worked), seatMin: mxMap(a.seatMin, b.seatMin), apMin: mxMap(a.apMin, b.apMin), best: mx(a.best, b.best),
+    });
+  }
+  const localCareer = () => { try { return JSON.parse(ls.get(CAREER) || 'null'); } catch (e) { return null; } };
+  const same = (x, y) => JSON.stringify(x) === JSON.stringify(y);
+  async function pull() {
+    const t = await token(); if (!t) return null;
+    const rows = await api(`/rest/v1/saves?select=career,updated_at&user_id=eq.${auth.user.id}`, { token: t });
+    return rows && rows[0] ? rows[0].career : null;
+  }
+  async function upsert(career, keepalive) {
+    const t = await token(); if (!t) return;
+    await api('/rest/v1/saves?on_conflict=user_id', { method: 'POST', token: t, keepalive,
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: { user_id: auth.user.id, career, updated_at: new Date().toISOString() } });
+    lastPushed = JSON.stringify(career);
+  }
+  let busy = false;
+  // Pull the cloud copy, combine it with this device's, and save both ways.
+  async function sync() {
+    if (!auth || busy) return; busy = true; setStatus('syncing');
+    try {
+      const remote = await pull(), local = localCareer();
+      const merged = remote ? merge(local, remote) : local;
+      if (merged && !same(merged, local) && ATC.career && ATC.career.load) {
+        ATC.career.load(merged);
+        window.dispatchEvent(new Event('atc:career'));
+      }
+      if (merged && !same(merged, remote)) await upsert(merged);
+      else lastPushed = JSON.stringify(merged);
+      setStatus('synced');
+    } catch (e) { setStatus(auth ? 'offline' : 'idle'); }
+    busy = false;
+  }
+  // Leaving the page: send what we have without waiting for the cloud copy.
+  async function push() {
+    const c = localCareer(); if (!auth || !c || JSON.stringify(c) === lastPushed) return;
+    await upsert(c, true);
+  }
+
+  // ── screens ──
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  function badge() {
+    if (!auth) return `<button id="acctBtn" class="acct" title="Sign in to keep your career on every device">☁ Sign in to sync</button>`;
+    const label = { syncing: 'Syncing…', synced: 'Synced', offline: 'Offline, will retry', idle: 'Signed in' }[status];
+    return `<button id="acctBtn" class="acct on" title="Account">☁ ${esc(auth.user.name)} · ${label}</button>`;
+  }
+  function renderBadges() {
+    let b = document.getElementById('acctBadge');
+    const card = document.getElementById('careerCard');
+    if (!b && card) { b = document.createElement('div'); b.id = 'acctBadge'; card.parentNode.insertBefore(b, card.nextSibling); }
+    if (b) { b.innerHTML = badge(); b.querySelector('#acctBtn').onclick = openModal; }
+    const m = document.getElementById('acctModal'); if (m && !m.classList.contains('hidden')) fillModal();
+  }
+  let prevModal = null, note = '', google = false;   // Google button shows once Google sign-in is turned on in Supabase
+  function openModal() {
+    let m = document.getElementById('acctModal');
+    if (!m) { m = document.createElement('div'); m.id = 'acctModal'; m.className = 'modal hidden'; m.innerHTML = '<div class="card acctcard"></div>'; document.body.appendChild(m); }
+    prevModal = [...document.querySelectorAll('.modal')].find((x) => x !== m && !x.classList.contains('hidden')) || null;
+    if (prevModal) prevModal.classList.add('hidden');
+    m.classList.remove('hidden'); fillModal();
+  }
+  function closeModal() {
+    document.getElementById('acctModal').classList.add('hidden'); note = '';
+    if (prevModal) prevModal.classList.remove('hidden');
+  }
+  function fillModal() {
+    const c = document.querySelector('#acctModal .card');
+    if (auth) {
+      c.innerHTML = `<h2>Your account</h2>
+        <p>Signed in as <b>${esc(auth.user.email || auth.user.name)}</b>.</p>
+        <p class="sub">Your rank, XP, lessons and awards are saved online and come with you to any device where you sign in. ${status === 'offline' ? 'You are offline right now, so changes will be sent when the connection is back.' : ''}</p>
+        <div class="btns2"><button id="acctSync">Sync now</button><button id="acctOut" class="danger">Sign out</button></div>
+        <p class="sub" id="acctNote">${esc(note)}</p>
+        <button id="acctBack" class="primary">Back</button>`;
+      c.querySelector('#acctSync').onclick = async () => { await sync(); note = status === 'synced' ? 'Up to date.' : 'Could not reach the server. Try again in a moment.'; fillModal(); };
+      c.querySelector('#acctOut').onclick = async () => { await signOut(); note = 'Signed out. Your career stays on this device.'; fillModal(); };
+    } else {
+      c.innerHTML = `<h2>Sign in</h2>
+        <p class="sub">Free and optional. Signing in keeps your rank, XP, lessons and awards on every device you play on: phone, tablet and computer. Your career on this device comes with you.</p>
+        ${google ? `<button id="acctGoogle" class="primary gbtn"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.4h6.5a5.6 5.6 0 0 1-2.4 3.6v3h3.9c2.2-2.1 3.5-5.1 3.5-8.7z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3c-1.1.7-2.5 1.2-4.1 1.2-3.1 0-5.8-2.1-6.7-5H1.3v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.3 14.3a7.2 7.2 0 0 1 0-4.6V6.6H1.3a12 12 0 0 0 0 10.8z"/><path fill="#EA4335" d="M12 4.8c1.8 0 3.3.6 4.6 1.8l3.4-3.4A12 12 0 0 0 1.3 6.6l4 3.1c.9-2.8 3.6-4.9 6.7-4.9z"/></svg>Continue with Google</button>
+        <div class="or"><span>or get a sign-in link by email</span></div>` : ''}
+        <form id="acctEmailForm" class="emailrow"><input id="acctEmail" type="email" autocomplete="email" placeholder="you@example.com" required><button type="submit">Email me a link</button></form>
+        <p class="sub" id="acctNote">${esc(note)}</p>
+        <button id="acctBack">Not now</button>`;
+      if (google) c.querySelector('#acctGoogle').onclick = signInGoogle;
+      c.querySelector('#acctEmailForm').onsubmit = async (e) => {
+        e.preventDefault(); const email = c.querySelector('#acctEmail').value.trim(); if (!email) return;
+        const btn = e.target.querySelector('button'); btn.disabled = true; note = 'Sending…'; c.querySelector('#acctNote').textContent = note;
+        try { await signInEmail(email); note = `Check ${email} for a sign-in link. Open it on this device.`; }
+        catch (err) { note = /rate|seconds/i.test(err.message) ? 'Too many emails just now. Wait a minute and try again.' : 'That did not work: ' + err.message; }
+        fillModal(); const f = document.getElementById('acctEmail'); if (f) f.value = email;
+      };
+    }
+    c.querySelector('#acctBack').onclick = closeModal;
+  }
+
+  async function init() {
+    if (!ENABLED) return;
+    try { auth = JSON.parse(ls.get(AUTH) || 'null'); } catch (e) { auth = null; }
+    listeners.push(renderBadges); renderBadges();
+    api('/auth/v1/settings').then((s) => { google = !!(s && s.external && s.external.google); emit(); }).catch(() => {});
+    const err = await readReturn();
+    if (err) { note = err; openModal(); }
+    if (auth) await sync();
+    // keep the cloud copy current while playing, and catch up when coming back to the tab
+    setInterval(() => { const c = ls.get(CAREER); if (auth && c && c !== lastPushed) sync(); }, 30000);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sync(); else push().catch(() => {}); });
+    window.addEventListener('pagehide', () => { push().catch(() => {}); });
+  }
+
+  window.ATC_ACCOUNT = { enabled: ENABLED, user: () => auth && auth.user, token, sync, merge, onChange: (f) => listeners.push(f), open: openModal };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();
 </script>
